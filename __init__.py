@@ -26,7 +26,7 @@ bl_info = {
     "description": "Adds vertex color channel masks, channel swizzling, and a vertex color sampler.",
     "author": "aurycat",
     "version": (1, 0),
-    "blender": (3, 0, 0),
+    "blender": (3, 6, 0), # Minimum tested version. Might work with older.
     "location": "View3D > Vertex Paint > Paint",
     "warning": "",
     "doc_url": "",
@@ -602,6 +602,12 @@ def pick_vertex_color_from_mouse_coord(ob, coord, context=bpy.context):
     rv3d = context.region_data
     ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
     view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+
+    world_to_obj = ob.matrix_world.inverted()
+    (_, world_to_obj_rot, _) = world_to_obj.decompose()
+    ray_origin = world_to_obj @ ray_origin
+    view_vector = world_to_obj_rot @ view_vector
+
     hit = ob.ray_cast(ray_origin, view_vector, depsgraph=context.evaluated_depsgraph_get())
 
     (hit_ok, location, _, face_index) = hit
