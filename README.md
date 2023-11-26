@@ -1,4 +1,6 @@
-# Vertex Color Utils add-on for Blender 4
+# Vertex Color Utils add-on for Blender
+
+Tested with Blender 3.6.5 and 4.0.1
 
 ## Installation
 
