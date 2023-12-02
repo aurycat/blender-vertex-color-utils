@@ -20,12 +20,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# History:
+# 1.0 Initial release
+# 1.1 Added "Linear to sRGB"/"sRGB to Linear" operators and fixed sRGB handling
+#     for the alpha channel in the Swizzle and Mask operators. Added "selected
+#     only" option for Swizzle op.
 
 bl_info = {
     "name": "Vertex Color Utils",
     "description": "Adds vertex color channel masks, channel swizzling, and a vertex color sampler.",
     "author": "aurycat",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 6, 0), # Minimum tested version. Might work with older.
     "location": "View3D > Vertex Paint > Paint",
     "warning": "",
@@ -59,6 +64,8 @@ def register():
     bpy.utils.register_class(VCU_OT_create_color_channel_mask)
     bpy.utils.register_class(VCU_OT_swizzle_channels)
     bpy.utils.register_class(VCU_OT_sample_vertex_color)
+    bpy.utils.register_class(VCU_OT_linear_to_srgb)
+    bpy.utils.register_class(VCU_OT_srgb_to_linear)
     bpy.utils.register_class(VCU_OT_unregister)
     bpy.types.VIEW3D_MT_paint_vertex.append(vcu_draw_menu)
 
@@ -69,6 +76,8 @@ def unregister():
     bpy.utils.unregister_class(VCU_OT_create_color_channel_mask)
     bpy.utils.unregister_class(VCU_OT_swizzle_channels)
     bpy.utils.unregister_class(VCU_OT_sample_vertex_color)
+    bpy.utils.unregister_class(VCU_OT_linear_to_srgb)
+    bpy.utils.unregister_class(VCU_OT_srgb_to_linear)
     bpy.utils.unregister_class(VCU_OT_unregister)
 
 class VCU_OT_unregister(Operator):
@@ -88,10 +97,20 @@ def vcu_draw_menu(self, context):
     mesh = ob.data
 
     layout.separator()
-    layout.operator("vertex_color_utils.sample_vertex_color", text="Sample Vertex Color")
+    layout.operator("vertex_color_utils.sample_vertex_color")
 
     layout.separator()
-    layout.operator("vertex_color_utils.swizzle_channels")
+    c1 = layout.operator("vertex_color_utils.linear_to_srgb")
+    c2 = layout.operator("vertex_color_utils.srgb_to_linear")
+    if mesh.use_paint_mask or mesh.use_paint_mask_vertex:
+        c1.selected_only = True
+        c2.selected_only = True
+
+    layout.separator()
+    sw = layout.operator("vertex_color_utils.swizzle_channels")
+    if mesh.use_paint_mask or mesh.use_paint_mask_vertex:
+        sw.selected_only = True
+
     if attr_name_is_mask(mesh.color_attributes.active_color_name):
         layout.operator("vertex_color_utils.apply_mask")
     else:
@@ -123,6 +142,37 @@ def shared_poll(self, context):
         return False
     return True
 
+
+# Returns a list or range of indices into color attribute data that corresponds
+# with selected vertices or faces, depending on the current masking mode, and also
+# depending on whether the color attribute is Vertex (POINT) or Face Corner (CORNER)
+#
+# For a POINT color attribute, there is a data point for every vertex.
+# For a CORNER color attribute, there is a data point for every "loop" (face corner).
+def get_selected_vertices_attr_index(selected_only, mesh, attr):
+    if attr.domain != 'POINT' and attr.domain != 'CORNER':
+        raise Exception("Unknown domain '" + attr.domain + "' on active color attribute.")
+
+    if selected_only and mesh.use_paint_mask: # Face selection. Affect whole faces.
+        if attr.domain == 'POINT':
+            # Return a list of all the vertex indices of all selected faces
+            # Wrap in sorted(set(..)) to remove duplicates
+            return sorted(set([vi for p in mesh.polygons if p.select for vi in p.vertices]))
+        elif attr.domain == 'CORNER':
+            # Return a list of all the loop indices of all selected faces
+            # This is the only mode where you can apply a color change to one face
+            # but not its neighbor sharing verticees.
+            # Wrap in sorted(set(..)) to remove duplicates
+            return sorted(set([li for p in mesh.polygons if p.select for li in p.loop_indices]))
+    elif selected_only and mesh.use_paint_mask_vertex: # Vertex selection. Affect individual vertices.
+        if attr.domain == 'POINT':
+            # Return a list of all vertex indices where the vertex is selected
+            return [i for i in range(len(attr.data)) if mesh.vertices[i].select]
+        elif attr.domain == 'CORNER':
+            # Return a list of all loop indices where the loop's vertex is selected
+            return [i for i in range(len(attr.data)) if mesh.vertices[mesh.loops[i].vertex_index].select]
+    else: # Affect all (do assignments inline for better performance)
+        return range(len(attr.data))
 
 
 #############################
@@ -249,8 +299,10 @@ def copy_to_mask(base, mask, ch):
         for i in range(n):
             mask.data[i].color = [0, 0, base.data[i].color[2], 1]
     elif ch == 'A':
+        # Put the alpha value into color_srgb to match the behavior of `copy_from_mask`.
+        # See the copy code for the alpha channel in that function for explanation.
         for i in range(n):
-            mask.data[i].color = [base.data[i].color[3], base.data[i].color[3], base.data[i].color[3], 1]
+            mask.data[i].color_srgb = [base.data[i].color[3], base.data[i].color[3], base.data[i].color[3], 1]
     elif ch == 'RG':
         for i in range(n):
             mask.data[i].color = [base.data[i].color[0], base.data[i].color[1], 0, 1]
@@ -287,8 +339,13 @@ def copy_from_mask(base, mask, ch):
         for i in range(n):
             base.data[i].color[2] = mask.data[i].color[2]
     elif ch == 'A':
+        # The alpha channel is not affected by gamma correction, since it
+        # isn't a color (i.e. it has the same value on sRGB and scene-linear).
+        # Since Blender paints in sRGB (the brush color is sRGB), use the sRGB
+        # value of the red channel. Therefore if you paint 0.5 gray on an
+        # alpha mask, 0.5 gets put into the alpha channel instead of ~0.217.
         for i in range(n):
-            base.data[i].color[3] = mask.data[i].color[0]
+            base.data[i].color[3] = mask.data[i].color_srgb[0]
     elif ch == 'RG':
         for i in range(n):
             base.data[i].color[0] = mask.data[i].color[0]
@@ -401,9 +458,17 @@ class VCU_OT_swizzle_channels(Operator):
     bl_idname = "vertex_color_utils.swizzle_channels"
     bl_label = "Swizzle / Reorder Channels"
     bl_options = {"REGISTER", "UNDO"}
-    bl_description = "Reorder or copy the contents of the R, G, B, and A channels. For example, if the swizzle string is 'BGRR', B moves to R, G is unchanged, R moves to B, and R is also copied into A. The swizzle characters may also be 0 or 1 to indicate clearing that channel to solid 0 or 1."
+    bl_description = \
+"Reorder or copy the contents of the R, G, B, and A channels. " + \
+"For example, if the swizzle string is 'BGRR', B moves to R, G is " + \
+"unchanged, R moves to B, and R is also copied into A. The swizzle " + \
+"characters may also be 0 or 1 to indicate clearing that channel to solid 0 or 1"
 
     swizzle_str: bpy.props.StringProperty(name="Swizzle String", default="RGBA")
+
+    selected_only: bpy.props.BoolProperty(name="Selected Only", default=False, description=\
+"Takes into account the paint mask mode (Face selection masking/Vertex selection masking/Neither). " + \
+"If Neither, all vertices are affected")
 
     @classmethod
     def poll(self, context):
@@ -428,20 +493,27 @@ class VCU_OT_swizzle_channels(Operator):
         if not (('R' in str) and ('G' in str) and ('B' in str) and ('A' in str)):
             self.report({'WARNING'}, "One or more channels will be lost in this swizzle operation.")
 
-        swizzle_channels(color_attrs.active_color, str)
+        swizzle_channels(mesh, color_attrs.active_color, str, self.selected_only)
         return {'FINISHED'}
 
 
-def swizzle_channels(attr, swizzle_str):
+def swizzle_channels(mesh, attr, swizzle_str, selected_only):
+    if swizzle_str == 'RGBA':
+        return
+
     m = {'R':0, 'G':1, 'B':2, 'A':3, '0':4, '1':5}
     new_r = m[swizzle_str[0]]
     new_g = m[swizzle_str[1]]
     new_b = m[swizzle_str[2]]
     new_a = m[swizzle_str[3]]
 
-    for i in range(len(attr.data)):
-        col = [attr.data[i].color[0], attr.data[i].color[1], attr.data[i].color[2], attr.data[i].color[3], 0, 1]
-        attr.data[i].color = [col[new_r], col[new_g], col[new_b], col[new_a]]
+    # Use color_srgb so that copying to/from the alpha channel keeps the same
+    # value that is painted with Blender's brush, which paints in sRGB.
+    # If this used .color, then if you painted (0.5,0,0) to a vertex, and then
+    # swizzled the red channel into alpha, the alpha channel would become ~0.217.
+    for i in get_selected_vertices_attr_index(selected_only, mesh, attr):
+        col = [attr.data[i].color_srgb[0], attr.data[i].color_srgb[1], attr.data[i].color_srgb[2], attr.data[i].color_srgb[3], 0, 1]
+        attr.data[i].color_srgb = [col[new_r], col[new_g], col[new_b], col[new_a]]
 
 
 
@@ -480,7 +552,7 @@ class VCU_OT_sample_vertex_color(bpy.types.Operator):
     bl_idname = "vertex_color_utils.sample_vertex_color"
     bl_label = "Sample Vertex Color"
     bl_options = {"REGISTER"}
-    bl_description = "Use the mouse to sample the attribute color of a particular vertex"
+    bl_description = "Use the mouse to sample the active attribute color of a particular vertex"
 
     first_modal = False
 
@@ -568,7 +640,7 @@ class VCU_OT_sample_vertex_color(bpy.types.Operator):
         if col_lin_str == col_srgb_str: # All 1s or 0s
             report_str = f"Color is  {col_lin_hex_str} ({col_lin_str})"
         else:
-            report_str = f"Linear color is  {col_lin_hex_str} ({col_lin_str})  |  SRGB color is {col_srgb_hex_str} ({col_srgb_str})"
+            report_str = f"Linear color is  {col_lin_hex_str} ({col_lin_str})  |  sRGB color is {col_srgb_hex_str} ({col_srgb_str})"
 
         if event.type == 'LEFTMOUSE':
             self.report({'INFO'}, report_str)
@@ -594,7 +666,12 @@ def col_to_hex(col):
 
 
 def f2s(f):
-    return str(int(f)) if f.is_integer() else "{:.3f}".format(f)
+    if f.is_integer():
+        return str(int(f))
+    o = "{:.3f}".format(f)
+    if o == "0.000" or o == "-0.000" or o == "0,000" or o == "-0,000":
+        return "0"
+    return o
 
 
 def pick_vertex_color_from_mouse_coord(ob, coord, context=bpy.context):
@@ -662,6 +739,82 @@ def pick_vertex_color_from_rayhit(ob, hit_loc, hit_face_index, context):
 
     else:
         raise Exception("Unknown domain '" + color_attr.domain + "' on active color attribute.")
+
+
+
+###################################
+### Linear <--> sRGB Conversion ###
+###################################
+
+# NOTE: "Linear" isn't a color space, but here it refers to what Blender
+# calls "scene linear", which is just sRGB without the gamma correction
+# curve. Here is a good explanation of gamma conversion and why it's done:
+# https://stackoverflow.com/a/12894053
+
+
+class VCU_OT_linear_to_srgb(Operator):
+    bl_idname = "vertex_color_utils.linear_to_srgb"
+    bl_label = "Linear to sRGB (Gamma Encode)"
+    bl_description = \
+"Blender's vertex color paint brushes already paint in sRGB color space, so you're " + \
+"unlikely to need this for a mesh created in Blender. However, if you have imported " + \
+"this mesh from somewhere else, it may be necessary to convert to sRGB. In effect, " + \
+"this replaces the Linear value that you'd see with 'Sample Vertex Color' with the sRGB value.\n\n" + \
+"Another use for this operator is if the mesh needs to be exported with Linear " + \
+"vertex colors, but a portion of it needs to keep the colors as you painted them " + \
+"(e.g. for use as extra per-vertex data in a shader). Select that portion and apply " + \
+"this operator, which turns the Linear value that gets exported into the sRGB value you painted"
+    bl_options = {"REGISTER", "UNDO"}
+
+    selected_only: bpy.props.BoolProperty(name="Selected Only", default=False, description=\
+"Takes into account the paint mask mode (Face selection masking/Vertex selection masking/Neither). " + \
+"If Neither, all vertices are affected")
+
+    @classmethod
+    def poll(self, context):
+        return shared_poll(self, context)
+
+    def execute(self, context):
+        ob = context.active_object
+        mesh = ob.data
+        attr = mesh.color_attributes.active_color
+        for i in get_selected_vertices_attr_index(self.selected_only, mesh, attr):
+            attr.data[i].color = attr.data[i].color_srgb
+        return {'FINISHED'}
+
+class VCU_OT_srgb_to_linear(Operator):
+    bl_idname = "vertex_color_utils.srgb_to_linear"
+    bl_label = "sRGB to Linear (Gamma Decode)"
+    bl_description = \
+"Blender's paint brushes paint in sRGB color space, so converting to sRGB *might* (see below) " + \
+"be necessary if the renderer of this mesh (e.g. a shader in a game engine) needs the " + \
+"vertex colors in linear space.\n\n" + \
+"Note that some mesh exporters in Blender, such the FBX exporter, let you choose " + \
+"whether to export vertex colors in sRGB or Linear, so you may wish to use that instead.\n\n" + \
+"If the vertex colors are being used for data in a shader, not as real colors, you should " + \
+"probably NOT use this. Paint the desired color values with the sRGB brush, export the mesh " + \
+"in sRGB, and the shader will receive the colors as you painted them.\n\n" + \
+"If the vertex colors are being used as actual colors in a shader, you *still* should " + \
+"probably NOT use this! Export the colors as sRGB so that the automatic interpolation between " + \
+"vertex and fragment programs interpolates in gamma space, which will look more correct. " + \
+"Then, in the fragment program, convert gamma to linear if the shader output expects linear colors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    selected_only: bpy.props.BoolProperty(name="Selected Only", default=False, description=\
+"Takes into account the paint mask mode (Face selection masking/Vertex selection masking/Neither). " + \
+"If Neither, all vertices are affected")
+
+    @classmethod
+    def poll(self, context):
+        return shared_poll(self, context)
+
+    def execute(self, context):
+        ob = context.active_object
+        mesh = ob.data
+        attr = mesh.color_attributes.active_color
+        for i in get_selected_vertices_attr_index(self.selected_only, mesh, attr):
+            attr.data[i].color_srgb = attr.data[i].color
+        return {'FINISHED'}
 
 
 
