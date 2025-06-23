@@ -4,9 +4,8 @@ Tested with Blender 3.6.5 and 4.0.1
 
 ## Installation
 
-1. [Download the plugin zip](https://gitlab.com/aurycat/blender-vertex-color-utils/-/archive/main/blender-vertex-color-utils-main.zip).
-2. In Blender, go to Edit > Preferences > Add-ons and click "Install...". Select the downloaded **zip file**.
-3. In the add-ons list, click the checkbox on "Mesh: Vertex Color Utils" to enable it.
+1. [Download the repository as a zip](https://github.com/aurycat/blender-vertex-color-utils/archive/refs/heads/main.zip), but don't unzip.
+2. In Blender, go to `Edit > Preferences > Add-ons > Dropdown in the top right > Install from Disk` and select the zip file.
 
 ## Features
 
